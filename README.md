@@ -27,6 +27,9 @@ volume** with a **128 MiB memory limit**.
 * Snapshots freeze the published lane list at creation time. Sample/
   quarantine downloads through a snapshot only ever concatenate files from
   that fixed list — lanes published later never mix in.
+* **On-demand read-name indexes** let the data-lake team recover the full
+  paired-end record(s) behind a suspicious read name from a published lane
+  without rescanning the FASTQ. See [Read-name indexes](#read-name-indexes).
 
 ## Running (Docker Compose, two instances on a shared volume)
 
@@ -67,18 +70,91 @@ curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
 | GET | `/snapshots`, `/snapshots/{id}` | List/inspect snapshots |
 | GET | `/snapshots/{id}/samples/{sample_id}/{mate}` | Snapshot-scoped concatenated download |
 | GET | `/snapshots/{id}/quarantine/{mate}` | Snapshot-scoped quarantine download |
+| POST | `/lanes/{lane}/samples/{sample_id}/index` | Build (or rebuild) a sample's read-name index |
+| POST | `/lanes/{lane}/quarantine/index` | Build the quarantine bucket's index |
+| GET | `/lanes/{lane}/samples/{sample_id}/index` | Index build status (`building`/`ready`/`failed`) |
+| GET | `/lanes/{lane}/quarantine/index` | Quarantine index build status |
+| GET | `/lanes/{lane}/indexes` | List every index task for a lane |
+| GET | `/lanes/{lane}/samples/{sample_id}/reads?read_name=...` | Retrieve all pairs with that name |
+| GET | `/lanes/{lane}/quarantine/reads?read_name=...` | Quarantine-scoped name lookup |
 | GET | `/health` | Liveness, instance id, current job, queue depth |
+
+## Read-name indexes
+
+When anomaly comparison flags a read name, the engineer first asks the
+service to materialise an **on-disk index** for the relevant published
+bucket (a per-sample pair of files, or the quarantine pair), then queries
+by name.
+
+### Lifecycle and guarantees
+
+* **On-demand, background builds.** `POST .../index` enqueues an index task
+  (`202`) and returns immediately; the background worker builds it without
+  blocking uploads, queries or downloads for any other lane. A repeat POST
+  while one exists returns the same task (`200`); POSTing a `failed` task
+  requeues a rebuild.
+* **Sequential verification, whole-bucket failure.** A build streams both
+  published gzip mates record by record and checks, in order: (1) every
+  file exists and is a complete, well-formed gzip FASTQ; (2) R1 and R2
+  read-name tokens match in the same order and record counts are equal;
+  (3) the indexed pair count equals the published count table. Any missing
+  file or mismatch fails the entire index — the bucket never gets a partial
+  index.
+* **Record size limits.** Only records whose read-name token is at most
+  **256 bytes** and whose sequence/quality lines (either mate) are at most
+  **1000 bytes** are indexed. An oversized record aborts the build with an
+  explicit error.
+* **Queryable only once fully on disk.** Builds run in a hidden
+  `indexes/.build.<id>/` staging directory and are atomically `rename`d to
+  `indexes/<id>/` only after the data is fsynced and a `COMPLETE` marker is
+  written. A lookup while absent/building returns `409` (or `404` if no index
+  was ever requested); a failed build returns `409` with the reason.
+* **No rescans on repeated queries.** Each index stores the records as plain
+  four-line FASTQ in `r1.store`/`r2.store` plus an SQLite table mapping
+  `name → ordinal → byte offsets`. A lookup seeks straight to the records;
+  the source gzip is never opened again.
+* **Duplicate names return every pair, in order.** A name shared by several
+  read segments yields all of them, ordered by their original ordinal.
+* **Crash and concurrency safety.** A build holds an exclusive `flock` on its
+  staging directory; startup recovery fails interrupted tasks and removes
+  their debris only when the lock is free, never touching a live build or a
+  `ready` index. Index tasks use an atomic `queued → building` claim, so the
+  two instances can never build the same `(lane, bucket)` index twice, and a
+  failed build leaves no usable half-product behind.
+
+### Example
+
+```bash
+# 1. request the index (202 = queued/building)
+curl -X POST http://localhost:8001/lanes/demoLane/samples/sampleA/index
+# 2. poll until "status": "ready"
+curl http://localhost:8001/lanes/demoLane/samples/sampleA/index
+# 3. fetch every pair carrying the suspicious name (works on either instance)
+curl "http://localhost:8002/lanes/demoLane/samples/sampleA/reads?read_name=read7"
+```
+
+The lookup response contains `matches: [{ordinal, r1:{name,sequence,plus,
+quality}, r2:{...}}, ...]` in original order, plus `total_matches`. An
+unknown name is a successful empty result (`total_matches: 0`).
 
 ## Concurrency and crash safety
 
 * **SQLite WAL** with `BEGIN IMMEDIATE` job claiming: exactly one instance
-  ever picks up a given job; the other keeps serving requests.
-* Each instance processes one lane at a time in a background thread, so a
-  slow lane never blocks uploads, queries or downloads on the event loop.
+  ever picks up a given job; the other keeps serving requests. Read-name
+  index tasks use the same pattern with an atomic `queued → building`
+  transition, so two instances never build the same `(lane, bucket)` index.
+* Each instance processes one task at a time in a background thread, so a
+  slow lane or a slow index build never blocks uploads, queries or downloads
+  on the event loop. The worker alternates between the job and index queues
+  so neither workload can starve the other.
 * A job runs under an exclusive `flock` on its work directory. Startup
   recovery removes scratch/staging debris only when no lock is held, and
   never deletes directories that have a published-lane DB row — so another
   instance's in-flight work and all published data are preserved.
+* An index build holds an exclusive `flock` on its hidden
+  `.build.<id>/lock`. On restart, interrupted builds are marked failed and
+  their staging directories removed only when that lock is free; `ready`
+  indexes (and any live, locked build) are never deleted.
 * Publish order: write/verify outputs in `work/`, move to
   `published/lanes/.tmp.<job>`, atomic `rename` to the final lane directory,
   then insert metadata in one DB transaction. Inputs are deleted only after
@@ -91,16 +167,30 @@ reads, one open gzip writer per bucket). No file is ever buffered whole.
 The automated streaming test processes hundreds of MiB of decompressed
 data with RSS growth below 64 MiB.
 
+Index builds follow the same profile: one record pair is in flight at a
+time, records are appended to plain stores, and the SQLite index commits in
+1024-record batches. A 200k-pair bucket builds with RSS growth below 64 MiB
+(see `test_index_build_constant_memory_on_large_bucket`), comfortably inside
+the 128 MiB container limit alongside the running API.
+
 ## Layout
 
 ```
-app/            FastAPI app, SQLite layer, streaming splitter, worker
+app/            FastAPI app, SQLite layer, streaming splitter, worker,
+                on-disk read-name indexer (app/indexing.py)
 scripts/        demo FASTQ generator, two-instance integration check
 tests/          pytest suite (happy path, corruption, retry, recovery,
-                barcode rules, size budget, streaming memory)
+                barcode rules, size budget, streaming memory, index build,
+                lookup, limits, index crash/concurrency recovery)
 Dockerfile      python:3.11-slim, non-root user, /data volume, healthcheck
 docker-compose.yml  two 128 MiB instances sharing one named volume
 ```
+
+On the shared volume, indexes live under `indexes/`: a hidden
+`.build.<index_id>/` staging directory (with a `lock`, partial stores and
+SQLite) becomes `indexes/<index_id>/` containing `r1.store`, `r2.store`,
+`index.sqlite`, `META`, the held `lock` and the `COMPLETE` marker only once
+durable.
 
 ## Tests
 
@@ -108,3 +198,10 @@ docker-compose.yml  two 128 MiB instances sharing one named volume
 python -m pytest tests/ -q
 python scripts/integration_two_instances.py   # real two-process check
 ```
+
+The integration script additionally exercises index build idempotency,
+cross-instance lookup, four-way concurrent POSTs collapsing onto a single
+shared index task, and continued lane submission/download while indexes
+build. Its SIGKILL section runs only where process signals are permitted;
+the equivalent index crash recovery is covered deterministically by the
+pytest suite elsewhere.

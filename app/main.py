@@ -6,15 +6,21 @@ import json
 import logging
 import re
 import shutil
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 
-from . import config, db, processing
+from . import config, db, indexing, processing
 from .worker import JobWorker, new_instance_id
 
 _IO_CHUNK = 1024 * 1024
@@ -112,6 +118,7 @@ def _safe_published_path(path_str: str) -> Path:
 async def lifespan(app: FastAPI):
     db.init_db()
     notes = processing.recover_on_startup()
+    notes.extend(indexing.recover_indexes_on_startup())
     for note in notes:
         log.info("startup recovery: %s", note)
     instance_id = new_instance_id()
@@ -135,7 +142,12 @@ app = FastAPI(
         "with at most one substitution and a unique candidate; everything "
         "else is quarantined. Barcodes and qualities are trimmed on "
         "assignment. Published lanes, per-sample files, quarantine files and "
-        "counts become visible atomically."
+        "counts become visible atomically.\n\n"
+        "Published buckets also support on-demand, on-disk read-name "
+        "indexes: POST an .../index endpoint to build one, poll its status, "
+        "then GET .../reads?read_name=... to retrieve every paired-end "
+        "record carrying that name in original order without rescanning the "
+        "FASTQ. Queries are answered only after the index is fully on disk."
     ),
     lifespan=lifespan,
 )
@@ -155,6 +167,10 @@ def health():
         "current_job": worker.current_job,
         "queued_jobs": db.get_conn().execute(
             "SELECT COUNT(*) c FROM jobs WHERE status='queued'").fetchone()["c"],
+        "building_indexes": db.get_conn().execute(
+            "SELECT COUNT(*) c FROM index_tasks "
+            "WHERE status IN ('queued','building')"
+        ).fetchone()["c"],
     }
 
 
@@ -304,6 +320,166 @@ def _bucket_file(lane: str, bucket: str, mate: str) -> Path:
     if row is None:
         raise HTTPException(404, f"bucket {bucket!r} not found in lane {lane}")
     return _safe_published_path(row[f"{mate}_file"])
+
+
+# ---------------- on-demand read-name indexes ----------------
+# These routes are registered BEFORE the wildcard {mate} download routes so
+# literal suffixes (index, reads) are matched first.
+
+def _published_bucket_or_404(lane: str, bucket: str):
+    """Resolve a sample_id (or the quarantine bucket) in a published lane."""
+    row = db.get_conn().execute(
+        "SELECT * FROM lane_counts WHERE lane=? AND sample_id=?",
+        (lane, bucket)).fetchone()
+    if row is None:
+        label = "quarantine bucket" if bucket == processing.QUARANTINE \
+            else f"sample {bucket!r}"
+        raise HTTPException(404, f"{label} not found in published lane {lane}")
+    return row
+
+
+def _index_public(row) -> dict[str, Any]:
+    bucket = row["bucket"]
+    # 'queued' (not yet claimed) is surfaced as the externally visible
+    # 'building' lifecycle state; only 'ready' allows queries.
+    status = "building" if row["status"] == "queued" else row["status"]
+    return {
+        "index_id": row["index_id"],
+        "lane": row["lane"],
+        "sample_id": None if bucket == processing.QUARANTINE else bucket,
+        "quarantine": bucket == processing.QUARANTINE,
+        "status": status,
+        "error": row["error"],
+        "read_pairs": row["read_pairs"],
+        "instance_id": row["instance_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _ensure_index_task(lane: str, bucket: str) -> tuple[dict[str, Any], bool]:
+    """Idempotent ensure-index: create/requeue a build, or return the ready
+    task. Returns (public task, accepted_async). Safe under concurrent POSTs
+    from both instances: a lost UNIQUE(lane,bucket) race resolves to the
+    winner's row instead of erroring."""
+    row = db.get_index_task_by_bucket(lane, bucket)
+    if row is None:
+        index_id = uuid.uuid4().hex
+        try:
+            db.create_index_task(
+                {
+                    "index_id": index_id,
+                    "lane": lane,
+                    "bucket": bucket,
+                    "created_at": db.utcnow(),
+                })
+        except sqlite3.IntegrityError:
+            # A concurrent POST on the other instance won the insert race.
+            rival = db.get_index_task_by_bucket(lane, bucket)
+            if rival is not None:
+                return _index_public(rival), False
+            raise
+        return _index_public(db.get_index_task(index_id)), True
+    if row["status"] == "failed":
+        # POST is an explicit rebuild request; clear the previous failure.
+        if not db.requeue_index_task(row["index_id"]):
+            # Another instance requeued it first; fall through to current row.
+            row = db.get_index_task_by_bucket(lane, bucket)
+        else:
+            row = db.get_index_task(row["index_id"])
+    return _index_public(row), row["status"] == "queued"
+
+
+@app.post("/lanes/{lane}/samples/{sample_id}/index", status_code=202)
+def build_sample_index(lane: str, sample_id: str):
+    if not _SAMPLE_RE.match(sample_id) or sample_id.startswith(_RESERVED_PREFIX):
+        raise HTTPException(400, "invalid sample_id")
+    _published_bucket_or_404(lane, sample_id)
+    task, accepted = _ensure_index_task(lane, sample_id)
+    if not accepted:
+        # 200 with the existing task (already building or ready).
+        return JSONResponse(task, status_code=200)
+    return task
+
+
+@app.post("/lanes/{lane}/quarantine/index", status_code=202)
+def build_quarantine_index(lane: str):
+    _published_bucket_or_404(lane, processing.QUARANTINE)
+    task, accepted = _ensure_index_task(lane, processing.QUARANTINE)
+    if not accepted:
+        return JSONResponse(task, status_code=200)
+    return task
+
+
+@app.get("/lanes/{lane}/indexes")
+def list_lane_indexes(lane: str):
+    if db.get_conn().execute(
+            "SELECT 1 FROM lane_publishes WHERE lane=?", (lane,)).fetchone() is None:
+        raise HTTPException(404, "lane not published (or unknown)")
+    return [_index_public(r) for r in db.list_index_tasks(lane)]
+
+
+@app.get("/lanes/{lane}/samples/{sample_id}/index")
+def get_sample_index(lane: str, sample_id: str):
+    if not _SAMPLE_RE.match(sample_id) or sample_id.startswith(_RESERVED_PREFIX):
+        raise HTTPException(400, "invalid sample_id")
+    _published_bucket_or_404(lane, sample_id)
+    row = db.get_index_task_by_bucket(lane, sample_id)
+    if row is None:
+        raise HTTPException(404, "no index has been built for this bucket yet")
+    return _index_public(row)
+
+
+@app.get("/lanes/{lane}/quarantine/index")
+def get_quarantine_index(lane: str):
+    _published_bucket_or_404(lane, processing.QUARANTINE)
+    row = db.get_index_task_by_bucket(lane, processing.QUARANTINE)
+    if row is None:
+        raise HTTPException(404, "no index has been built for the quarantine "
+                                 "bucket yet")
+    return _index_public(row)
+
+
+def _validate_lookup_name(name: str) -> str:
+    if not name:
+        raise HTTPException(400, "read_name query parameter is required")
+    try:
+        raw = name.encode("latin-1")
+    except UnicodeEncodeError:
+        raise HTTPException(400, "read_name must be Latin-1/byte characters")
+    if len(raw) > config.MAX_READ_NAME_BYTES:
+        raise HTTPException(
+            400, f"read_name must be at most {config.MAX_READ_NAME_BYTES} bytes")
+    return name
+
+
+def _lookup_or_http(lane: str, bucket: str, name: str):
+    try:
+        return indexing.lookup_reads(lane, bucket, name)
+    except indexing.IndexNotReadyError as exc:
+        code = 404 if exc.status == "absent" else 409
+        raise HTTPException(code, str(exc))
+    except indexing.IndexBuildError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/lanes/{lane}/samples/{sample_id}/reads")
+def lookup_sample_reads(lane: str, sample_id: str, read_name: str = Query(
+        ..., alias="read_name",
+        description="Exact read name token (the first token after '@')")):
+    if not _SAMPLE_RE.match(sample_id) or sample_id.startswith(_RESERVED_PREFIX):
+        raise HTTPException(400, "invalid sample_id")
+    _published_bucket_or_404(lane, sample_id)
+    name = _validate_lookup_name(read_name)
+    return _lookup_or_http(lane, sample_id, name)
+
+
+@app.get("/lanes/{lane}/quarantine/reads")
+def lookup_quarantine_reads(lane: str, read_name: str = Query(
+        ..., description="Exact read name token (the first token after '@')")):
+    _published_bucket_or_404(lane, processing.QUARANTINE)
+    name = _validate_lookup_name(read_name)
+    return _lookup_or_http(lane, processing.QUARANTINE, name)
 
 
 @app.get("/lanes/{lane}/samples/{sample_id}/{mate}")

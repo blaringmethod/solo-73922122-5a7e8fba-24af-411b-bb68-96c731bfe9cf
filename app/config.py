@@ -29,13 +29,21 @@ DB_PATH = DATA_DIR / "demux.db"
 INCOMING_DIR = DATA_DIR / "incoming"
 WORK_DIR = DATA_DIR / "work"
 PUBLISHED_DIR = DATA_DIR / "published"
+INDEX_DIR = DATA_DIR / "indexes"
 
 # Hard limits from the task specification.
 MAX_SAMPLES = 8
 BARCODE_LEN = 8
 MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024  # 512 MiB across both mates
+
+# On-demand read-name index limits (per record).
+MAX_READ_NAME_BYTES = 256       # read name token (without '@' / newline)
+MAX_SEQ_QUAL_BYTES = 1000       # each sequence or quality line, either mate
+
+# Commit the on-disk index in batches so journal/RAM stays small.
+INDEX_COMMIT_EVERY = 1024
 HEARTBEAT_FLUSH_EVERY = 256  # records between heartbeat writes
 POLL_INTERVAL = float(os.environ.get("DEMUX_POLL_INTERVAL", "1.0"))
 
-for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR):
+for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR, INDEX_DIR):
     _d.mkdir(parents=True, exist_ok=True)

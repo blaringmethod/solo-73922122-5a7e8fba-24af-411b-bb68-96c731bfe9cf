@@ -68,6 +68,23 @@ CREATE TABLE IF NOT EXISTS snapshot_lanes (
     seq         INTEGER NOT NULL,
     PRIMARY KEY (snapshot_id, lane)
 );
+
+CREATE TABLE IF NOT EXISTS index_tasks (
+    index_id    TEXT PRIMARY KEY,
+    lane        TEXT NOT NULL,
+    bucket      TEXT NOT NULL,           -- sample_id, or '' for quarantine
+    status      TEXT NOT NULL CHECK (status IN
+                    ('queued','building','ready','failed')),
+    error       TEXT,
+    instance_id TEXT,
+    read_pairs  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (lane, bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_index_tasks_status
+    ON index_tasks(status);
 """
 
 _local = threading.local()
@@ -288,3 +305,101 @@ def list_snapshots() -> list[dict[str, Any]]:
         for r in get_conn().execute(
             "SELECT * FROM snapshots ORDER BY created_at").fetchall()
     ]
+
+
+# ---------- on-demand read-name index tasks ----------
+
+def create_index_task(row: dict[str, Any]) -> None:
+    with tx() as conn:
+        conn.execute(
+            """INSERT INTO index_tasks (index_id, lane, bucket, status, error,
+                                        instance_id, read_pairs,
+                                        created_at, updated_at)
+               VALUES (:index_id,:lane,:bucket,'queued',NULL,NULL,0,
+                       :created_at,:created_at)""",
+            row,
+        )
+
+
+def get_index_task_by_bucket(lane: str, bucket: str) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM index_tasks WHERE lane=? AND bucket=?",
+        (lane, bucket)).fetchone()
+
+
+def get_index_task(index_id: str) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM index_tasks WHERE index_id=?", (index_id,)).fetchone()
+
+
+def list_index_tasks(lane: str | None = None) -> list[sqlite3.Row]:
+    if lane is None:
+        return get_conn().execute(
+            "SELECT * FROM index_tasks ORDER BY created_at").fetchall()
+    return get_conn().execute(
+        "SELECT * FROM index_tasks WHERE lane=? ORDER BY created_at",
+        (lane,)).fetchall()
+
+
+def requeue_index_task(index_id: str) -> bool:
+    """Reset a failed task so the next poll cycle rebuilds it."""
+    with tx() as conn:
+        row = conn.execute(
+            "SELECT status FROM index_tasks WHERE index_id=?",
+            (index_id,)).fetchone()
+        if row is None or row["status"] != "failed":
+            return False
+        conn.execute(
+            """UPDATE index_tasks SET status='queued', error=NULL,
+                                      instance_id=NULL, read_pairs=0,
+                                      updated_at=? WHERE index_id=?""",
+            (_now(), index_id))
+    return True
+
+
+def claim_next_index_task(instance_id: str) -> sqlite3.Row | None:
+    """Atomically take one queued task. The status predicate means two
+    instances can never claim the same index build."""
+    with tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM index_tasks WHERE status='queued' "
+            "ORDER BY created_at LIMIT 1").fetchone()
+        if row is None:
+            return None
+        updated = conn.execute(
+            "UPDATE index_tasks SET status='building', instance_id=?, "
+            "updated_at=? WHERE index_id=? AND status='queued'",
+            (instance_id, _now(), row["index_id"]))
+        if updated.rowcount != 1:  # lost a race; let the next poll re-check
+            return None
+    return get_index_task(row["index_id"])
+
+
+def index_heartbeat(index_id: str, instance_id: str) -> None:
+    get_conn().execute(
+        "UPDATE index_tasks SET updated_at=? WHERE index_id=? AND instance_id=?",
+        (_now(), index_id, instance_id))
+
+
+def index_progress(index_id: str, instance_id: str, pairs: int) -> None:
+    get_conn().execute(
+        "UPDATE index_tasks SET read_pairs=?, updated_at=? "
+        "WHERE index_id=? AND instance_id=?",
+        (pairs, _now(), index_id, instance_id))
+
+
+def mark_index_failed(index_id: str, instance_id: str, error: str) -> None:
+    with tx() as conn:
+        conn.execute(
+            """UPDATE index_tasks SET status='failed', error=?, updated_at=?
+               WHERE index_id=? AND instance_id=?""",
+            (error[:2000], _now(), index_id, instance_id))
+
+
+def mark_index_ready(index_id: str, instance_id: str, pairs: int) -> None:
+    with tx() as conn:
+        conn.execute(
+            """UPDATE index_tasks SET status='ready', error=NULL,
+                                      read_pairs=?, updated_at=?
+               WHERE index_id=? AND instance_id=?""",
+            (pairs, _now(), index_id, instance_id))

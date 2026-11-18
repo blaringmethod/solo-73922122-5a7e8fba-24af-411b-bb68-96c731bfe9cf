@@ -221,16 +221,103 @@ def main() -> int:
         boundary, body = multipart("laneIT0", bad_barcodes, r1, r2)
         code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
         assert code == 409, (code, resp)
+
+        print("[6] on-demand read-name index: build, idempotency, lookup")
+        code, resp = http("POST", f"{BASE_A}/lanes/laneIT0/samples/sampleA/index")
+        assert code == 202, (code, resp)
+        idx = json.loads(resp)
+        index_id = idx["index_id"]
+        # Concurrent POST from the other instance must not start a second
+        # build: it may already be queued (202) or claimed (200), but the
+        # index id must be identical.
+        code, resp = http("POST", f"{BASE_B}/lanes/laneIT0/samples/sampleA/index")
+        assert code in (200, 202) and json.loads(resp)["index_id"] == index_id
+        # Quarantine bucket index can be built in parallel on the other queue.
+        code, resp = http("POST", f"{BASE_B}/lanes/laneIT0/quarantine/index")
+        assert code == 202, (code, resp)
+
+        def wait_index(base, path, timeout=90):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                code, body = http("GET", base + path)
+                row = json.loads(body)
+                if row["status"] in ("ready", "failed"):
+                    return row
+                time.sleep(0.2)
+            raise RuntimeError("index build timeout")
+
+        ready = wait_index(BASE_A, "/lanes/laneIT0/samples/sampleA/index")
+        assert ready["status"] == "ready", ready
+        qready = wait_index(BASE_B, "/lanes/laneIT0/quarantine/index")
+        assert qready["status"] == "ready", qready
+
+        # Lookup on the *other* instance (shared volume) returns every pair
+        # carrying the name, in original order; repeated calls never rescan.
+        code, body = http(
+            "GET", f"{BASE_B}/lanes/laneIT0/samples/sampleA/reads?read_name=read0")
+        assert code == 200, (code, body)
+        payload = json.loads(body)
+        assert payload["total_matches"] >= 1
+        ords = [m["ordinal"] for m in payload["matches"]]
+        assert ords == sorted(ords)
+        # Same-name duplicate reads all come back, not just the first.
+        code, body = http(
+            "GET", f"{BASE_B}/lanes/laneIT0/samples/sampleA/reads?read_name=missing")
+        assert code == 200 and json.loads(body)["total_matches"] == 0
+        # Querying before an index exists is a 404; unknown lanes 404 as well.
+        code, _ = http(
+            "GET", f"{BASE_A}/lanes/laneIT1/samples/sampleA/reads?read_name=read0")
+        assert code == 404
+
+        # Building an index never blocks other lanes: submit, publish and
+        # download another lane while indexes exist/build.
+        boundary, body = multipart("laneITDuringIndex", barcodes, r1, r2)
+        code, resp = http("POST", f"{BASE_A}/jobs", raw_path=(boundary, body))
+        jid = json.loads(resp)["job"]["job_id"]
+        assert wait_job(BASE_A, jid)["status"] == "published"
+        code, body = http(
+            "GET", f"{BASE_B}/lanes/laneITDuringIndex/samples/sampleB/r1")
+        assert code == 200 and len(body) > 0
+        print("    index builds and cross-instance lookups verified")
+
+        print("[7] concurrent builds of the same index never duplicate work")
+        # Four simultaneous POSTs across both instances: exactly one task must
+        # ever exist for the (lane, bucket) pair and it must end up ready.
+        import concurrent.futures
+        targets = [
+            (BASE_A, "/lanes/laneIT1/samples/sampleA/index"),
+            (BASE_B, "/lanes/laneIT1/samples/sampleA/index"),
+            (BASE_A, "/lanes/laneIT1/samples/sampleA/index"),
+            (BASE_B, "/lanes/laneIT1/samples/sampleA/index"),
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(pool.map(
+                lambda t: http("POST", t[0] + t[1]), targets))
+        codes = [c for c, _ in responses]
+        assert all(c in (200, 202) for c in codes), codes
+        ids = {json.loads(b)["index_id"] for _, b in responses}
+        assert len(ids) == 1, f"expected one index task, got {ids}"
+        listed = json.loads(http(
+            "GET", f"{BASE_A}/lanes/laneIT1/indexes")[1])
+        assert len([t for t in listed if t["sample_id"] == "sampleA"]) == 1
+        ready = wait_index(BASE_B, "/lanes/laneIT1/samples/sampleA/index")
+        assert ready["status"] == "ready"
+        # The shared index is queryable from both instances.
+        for base in (BASE_A, BASE_B):
+            code, body = http(
+                "GET", base + "/lanes/laneIT1/samples/sampleA/reads?read_name=read0")
+            assert code == 200 and json.loads(body)["total_matches"] >= 1
+        print("    single shared index task; ready and queryable on both")
     finally:
         signalled = [stop(p) for p in procs]
 
     if not all(signalled):
-        print("\n[6] SKIPPED hard-crash section: sandbox denies process signals")
+        print("\n[8] SKIPPED hard-crash section: sandbox denies process signals")
         print("    Crash recovery is covered by: pytest tests/test_failure_and_recovery.py")
         print("\nINTEGRATION CHECKS PASSED (crash section skipped here)")
         return 0
 
-    print("[6] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
+    print("[8] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
     c = start_instance(PORT_A, data_dir)
     try:
         boundary, body = multipart("laneCrash", barcodes, r1, r2)
@@ -269,6 +356,58 @@ def main() -> int:
             code, _ = http("POST", f"{BASE_B}/jobs/{crash_jid}/retry")
             assert code == 200
             assert wait_job(BASE_B, crash_jid)["status"] == "published"
+
+            print("[8a] hard-crash recovery for an interrupted index build")
+            # Publish a fresh lane, start an index, kill the builder, then
+            # restart: the half-built directory must be cleaned and the task
+            # marked failed, after which a rebuild succeeds.
+            boundary, body = multipart("laneIdxCrash", barcodes, r1, r2)
+            code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
+            assert wait_job(BASE_B, json.loads(resp)["job"]["job_id"])[
+                "status"] == "published"
+            e = start_instance(PORT_A, data_dir)
+            try:
+                code, resp = http(
+                    "POST", f"{BASE_A}/lanes/laneIdxCrash/samples/sampleA/index")
+                idx_id = json.loads(resp)["index_id"]
+                e.kill()
+                e.wait(timeout=15)
+                from app import indexing as indexing_mod
+                importlib.reload(cfg)
+                build_dir = cfg.INDEX_DIR / f".build.{idx_id}"
+                build_dir.mkdir(parents=True, exist_ok=True)
+                (build_dir / "index.sqlite").write_bytes(b"half")
+                (build_dir / "lock").write_text("ghost\n")
+                dbmod.get_conn().execute(
+                    "UPDATE index_tasks SET status='building', "
+                    "instance_id='ghost' WHERE index_id=?", (idx_id,))
+
+                f = start_instance(PORT_B, data_dir)
+                try:
+                    deadline = time.time() + 20
+                    while time.time() < deadline:
+                        code, body = http(
+                            "GET", f"{BASE_B}/lanes/laneIdxCrash/samples/sampleA/index")
+                        if json.loads(body)["status"] == "failed":
+                            break
+                        time.sleep(0.3)
+                    row = json.loads(body)
+                    assert row["status"] == "failed" and "interrupted" in row["error"]
+                    assert not build_dir.exists()  # debris cleaned on restart
+                    code, _ = http(
+                        "POST", f"{BASE_B}/lanes/laneIdxCrash/samples/sampleA/index")
+                    assert code == 202
+                    rebuilt = wait_index(
+                        BASE_B, "/lanes/laneIdxCrash/samples/sampleA/index")
+                    assert rebuilt["status"] == "ready"
+                finally:
+                    stop(f)
+            finally:
+                if e.poll() is None:
+                    try:
+                        e.kill()
+                    except PermissionError:
+                        pass
         finally:
             stop(d)
     finally:
